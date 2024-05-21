@@ -127,6 +127,7 @@ litellm.suppress_debug_info = True
 from fastapi import (
     FastAPI,
     Request,
+    Cookie,
     HTTPException,
     status,
     Depends,
@@ -143,6 +144,7 @@ from fastapi.responses import (
     StreamingResponse,
     FileResponse,
     ORJSONResponse,
+    PlainTextResponse,
     JSONResponse,
 )
 from fastapi.responses import RedirectResponse
@@ -246,7 +248,8 @@ except:
     pass
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    #allow_origins=origins,
+    allow_origins=['*'],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -333,13 +336,18 @@ def _get_pydantic_json_dict(pydantic_obj: BaseModel) -> dict:
 
 
 async def user_api_key_auth(
-    request: Request, api_key: str = fastapi.Security(api_key_header)
+    request: Request, api_key: str = fastapi.Security(api_key_header),ads_id: str | None = Cookie(default=None)
 ) -> UserAPIKeyAuth:
     global master_key, prisma_client, llm_model_list, user_custom_auth, custom_db_client, general_settings
     try:
         if isinstance(api_key, str):
             passed_in_key = api_key
             api_key = _get_bearer_token(api_key=api_key)
+            if len(api_key) == 0:
+                api_key = ads_id
+        elif ads_id:
+            api_key = ads_id
+            
 
         ### USER-DEFINED AUTH FUNCTION ###
         if user_custom_auth is not None:
@@ -2768,9 +2776,56 @@ async def async_data_generator(response, user_api_key_dict):
         error_returned = json.dumps({"error": proxy_exception.to_dict()})
         yield f"data: {error_returned}\n\n"
 
+async def async_custom_data_generator(response, user_api_key_dict):
+    verbose_proxy_logger.debug("inside generator")
+    try:
+        start_time = time.time()
+        chunk = response.body.decode('utf8')
+        #chunk = chunk.model_dump_json(exclude_none=True)
+        try:
+            yield f"data: {chunk}\n\n"
+        except Exception as e:
+            yield f"data: {str(e)}\n\n"
+        verbose_proxy_logger.debug(
+            f"async_custom_data_generator chunk: {chunk}"
+        )
+        # Streaming is done, yield the [DONE] chunk
+        done_message = "[DONE]"
+        yield f"data: {done_message}\n\n"
+    except Exception as e:
+        traceback.print_exc()
+        await proxy_logging_obj.post_call_failure_hook(
+            user_api_key_dict=user_api_key_dict, original_exception=e
+        )
+        verbose_proxy_logger.debug(
+            f"\033[1;31mAn error occurred: {e}\n\n Debug this by setting `--debug`, e.g. `litellm --model gpt-3.5-turbo --debug`"
+        )
+        router_model_names = llm_router.model_names if llm_router is not None else []
+        if user_debug:
+            traceback.print_exc()
+
+        if isinstance(e, HTTPException):
+            raise e
+        else:
+            error_traceback = traceback.format_exc()
+            error_msg = f"{str(e)}\n\n{error_traceback}"
+
+        proxy_exception = ProxyException(
+            message=getattr(e, "message", error_msg),
+            type=getattr(e, "type", "None"),
+            param=getattr(e, "param", "None"),
+            code=getattr(e, "status_code", 500),
+        )
+        error_returned = json.dumps({"error": proxy_exception.to_dict()})
+        yield f"data: {error_returned}\n\n"
+
 
 def select_data_generator(response, user_api_key_dict):
     return async_data_generator(response=response, user_api_key_dict=user_api_key_dict)
+
+def select_custom_data_generator(response, user_api_key_dict):
+    return async_custom_data_generator(response=response, user_api_key_dict=user_api_key_dict)
+
 
 
 def get_litellm_model_info(model: dict = {}):
@@ -3224,6 +3279,7 @@ async def chat_completion(
             # if users are using user_api_key_auth, set `user` in `data`
             data["user"] = user_api_key_dict.user_id
 
+
         if "metadata" not in data:
             data["metadata"] = {}
         data["metadata"]["user_api_key"] = user_api_key_dict.api_key
@@ -3270,7 +3326,101 @@ async def chat_completion(
             data["max_tokens"] = user_max_tokens
         if user_api_base:
             data["api_base"] = user_api_base
-
+        # 将api_key 透传到 data['api_key']中，确保自定义的 api key 可以被后端 api 服务所使用。
+        response = None
+        if user_api_key_dict.api_key:
+            verbose_proxy_logger.debug("proxy_server.chat_completion user_api_key_dict: %s", user_api_key_dict)
+            if user_api_key_dict.user_role == "new_api_user":
+                if (
+                    "stream" in data and data["stream"] == True
+                ):  # use generate_responses to stream responses
+                    content = {
+                        "id": "chatcmpl-9961L5kC5q0owGlbLN7o4Ljef5Vxv",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": "你的 api key 已经校验通过，请继续向我提问 \n ![哪吒汽车](https://new-official-website.oss-cn-hangzhou.aliyuncs.com/static/images/pc/brand/brand8.png)",
+                                    "role": "assistant"
+                                }
+                            }
+                        ],
+                        "created": 1711955123,
+                        "model": "gpt-3.5-turbo",
+                        "object": "chat.completion.chunk",
+                        "system_fingerprint": "fp_b28b39ffa8",
+                        "usage": {}
+                    }
+                    custom_headers = {
+                        "x-litellm-model-id": "",
+                        "set-cookie":"ads_id=sk-7cfAKBQNaAsWqUM93fF8D863Df62496eAf674d218a7614Ba; Domain=localhost; Path=/; SameSite=Lax"
+                    }
+                    response = JSONResponse(content=content)
+                    response.set_cookie(key="ads_id",samesite="Lax",domain="localhost",value=user_api_key_dict.api_key)
+                    selected_data_generator = select_custom_data_generator(
+                        response=response, user_api_key_dict=user_api_key_dict
+                    )
+                    return StreamingResponse(
+                        selected_data_generator,
+                        media_type="text/event-stream",
+                        headers=custom_headers,
+                    )
+                else:
+                    content = {
+                            "id": "chatcmpl-TwmJHFDgjViAqnjPbDohVbhkDHaEM",
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "index": 0,
+                                    "message": {
+                                        "content": "你的 api key 已经校验通过，请继续向我提问",
+                                        "role": "assistant"
+                                    }
+                                }
+                            ],
+                            "created": 1711906363,
+                            "model": "gpt-3.5-turbo-0125",
+                            "object": "chat.completion",
+                            "system_fingerprint": "",
+                            "usage": {
+                                "completion_tokens": 1,
+                                "prompt_tokens": 10,
+                                "total_tokens": 11
+                            }
+                    }
+                    response = JSONResponse(content=content)
+                    response.set_cookie(key="ads_id",samesite="Lax",domain="localhost",value=user_api_key_dict.api_key)
+                return response
+                
+            if user_api_key_dict.api_key == "None":
+                content = {
+                            "id": "chatcmpl-TwmJHFDgjViAqnjPbDohVbhkDHaEM",
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "index": 0,
+                                    "message": {
+                                        "content": "你没有合法的 api key 请输入你的 api key。",
+                                        "role": "assistant"
+                                    }
+                                }
+                            ],
+                            "created": 1711906363,
+                            "model": "gpt-3.5-turbo-0125",
+                            "object": "chat.completion",
+                            "system_fingerprint": "",
+                            "usage": {
+                                "completion_tokens": 1,
+                                "prompt_tokens": 10,
+                                "total_tokens": 11
+                            }
+                        }
+                response = JSONResponse(content=content)
+                #response.delete_cookie(key="ads_id")
+                return response
+                
+            else:
+                data['api_key'] = user_api_key_dict.api_key
         ### MODEL ALIAS MAPPING ###
         # check if model name in model alias map
         # get the actual model name
@@ -3294,9 +3444,10 @@ async def chat_completion(
         ### ROUTE THE REQUEST ###
         # Do not change this - it should be a constant time fetch - ALWAYS
         router_model_names = llm_router.model_names if llm_router is not None else []
-        # skip router if user passed their key
+        # skip router if user passed their key 对于跟 openai 兼容的服务而言，也可以配合 api_base 直接使用
         if "api_key" in data:
             tasks.append(litellm.acompletion(**data))
+            verbose_proxy_logger.debug("litellm.acompletion data: %s", data)
         elif "user_config" in data:
             # initialize a new router instance. make request using this Router
             router_config = data.pop("user_config")
@@ -3328,19 +3479,23 @@ async def chat_completion(
         responses = await asyncio.gather(
             *tasks
         )  # run the moderation check in parallel to the actual llm api call
-        response = responses[1]
-
+        if not response:
+            response = responses[1]
+        
         # Post Call Processing
         data["litellm_status"] = "success"  # used for alerting
         if hasattr(response, "_hidden_params"):
             model_id = response._hidden_params.get("model_id", None) or ""
         else:
             model_id = ""
-
+        
         if (
             "stream" in data and data["stream"] == True
         ):  # use generate_responses to stream responses
-            custom_headers = {"x-litellm-model-id": model_id}
+            custom_headers = {
+                "x-litellm-model-id": model_id,
+                "set-cookie":"ads_id=sk-7cfAKBQNaAsWqUM93fF8D863Df62496eAf674d218a7614Ba; Domain=localhost; Path=/; SameSite=Lax"
+            }
             selected_data_generator = select_data_generator(
                 response=response, user_api_key_dict=user_api_key_dict
             )
@@ -3349,7 +3504,8 @@ async def chat_completion(
                 media_type="text/event-stream",
                 headers=custom_headers,
             )
-
+        #将api key 设置到 cookie 中保存
+        fastapi_response.set_cookie(key="ads_id", value="sk-7cfAKBQNaAsWqUM93fF8D863Df62496eAf674d218a7614Ba")
         fastapi_response.headers["x-litellm-model-id"] = model_id
 
         ### CALL HOOKS ### - modify outgoing data
